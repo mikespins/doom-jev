@@ -76,12 +76,19 @@ class NavGrid:
         self.h = int((max(ys) + 64 - self.y0) // CELL) + 1
         self.blocked = np.zeros((self.h, self.w), dtype=bool)
         for x1, y1, x2, y2, kind in walls:
-            if kind != "wall":
-                continue  # closed doors stay passable: Jev can open them
+            # Doors are blocked too: many "closed" sectors are lifts or props, and routing
+            # through them sends the player into walls. Jev still opens doors right ahead.
             n = max(2, int(math.hypot(x2 - x1, y2 - y1) // 4))
             for t in np.linspace(0, 1, n):
                 cx, cy = self.cell(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)
                 self.blocked[cy, cx] = True
+        # Keep routes a player-width away from walls so steering doesn't scrape along them.
+        b = self.blocked.copy()
+        b[1:, :] |= self.blocked[:-1, :]
+        b[:-1, :] |= self.blocked[1:, :]
+        b[:, 1:] |= self.blocked[:, :-1]
+        b[:, :-1] |= self.blocked[:, 1:]
+        self.blocked = b
         self.seen = np.zeros_like(self.blocked)
         self.temp_blocked = {}  # cell -> expiry time, for things we got stuck on
         self.path = []
