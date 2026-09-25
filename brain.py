@@ -6,6 +6,7 @@ flight). A response is applied only if it is newer than the last applied one.
 
 import asyncio
 import json
+import math
 import os
 import queue
 import random
@@ -57,6 +58,8 @@ class Brain:
         self.new_seen = []
         self.last_route = 0.0
         self.last_unstick = 0.0
+        self.door_try = None     # (door point, start time, start position) of the current attempt
+        self.failed_doors = []   # (x, y, expiry): doors that did not open after a few tries
         self.jev_action, self.snap_q, self.event_q, self.ui_q = jev_action, snap_q, event_q, ui_q
         self.ctrl, self.metas, _ = S.views(shm.buf)
         self.describer = P.Describer()
@@ -113,6 +116,33 @@ class Brain:
                          chosen="shoot" if ev["name"] == "shoot" else "stop_forward",
                          jev_action_overridden=ev["overrode"], latency_ms=0.0)
 
+    def check_door(self, snap, now):
+        """Give up on a "door" that hasn't opened after ~2.5 s of trying: hide it from
+        Jev for 30 s and route around it."""
+        self.failed_doors = [d for d in self.failed_doors if d[2] > now]
+        if snap.door_dist is None:
+            self.door_try = None
+            return
+        a = math.radians(snap.angle)
+        dx, dy = snap.px + math.cos(a) * snap.door_dist, snap.py + math.sin(a) * snap.door_dist
+        if any(math.hypot(dx - x, dy - y) < 64 for x, y, _ in self.failed_doors):
+            snap.door_dist = None
+            return
+        trying = S.ACTIONS[self.jev_action.value] == "use_open_door"
+        if not trying:
+            self.door_try = None
+        elif self.door_try is None or math.hypot(dx - self.door_try[0][0], dy - self.door_try[0][1]) > 64:
+            self.door_try = ((dx, dy), now, (snap.px, snap.py))
+        elif now - self.door_try[1] > 2.5:
+            moved = math.hypot(snap.px - self.door_try[2][0], snap.py - self.door_try[2][1])
+            if moved < 48:
+                self.failed_doors.append((dx, dy, now + 30))
+                if self.grid is not None:
+                    self.grid.block_ahead(snap.px, snap.py, snap.angle, seconds=30)
+                    self.last_route = 0.0
+                snap.door_dist = None
+            self.door_try = None
+
     def nav_line(self, snap, now):
         """Route to the nearest unexplored area, in words. Also shares the heading
         with the game so it can steer while walking."""
@@ -155,6 +185,7 @@ class Brain:
                 if (snap is not None and snap.tic != last_tic and self.inflight < self.args.max_inflight
                         and len(self.sent_times) < self.args.max_per_minute):
                     last_tic = snap.tic
+                    self.check_door(snap, now)
                     self.text = self.describer.describe(snap, self.nav_line(snap, now))
                     if self.describer.stuck and self.grid is not None and now - self.last_unstick > 2:
                         self.last_unstick = now  # route around whatever we are pushing against

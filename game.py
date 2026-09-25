@@ -176,7 +176,7 @@ class Game:
 
         snap = P.Snapshot(tic=state.tic, t=time.monotonic(), health=v[0], armor=v[1], ammo=v[2],
                           px=v[3], py=v[4], angle=v[5], damage_taken=v[6], objs=objs, depth=depth,
-                          move_pressed=act in ("move_forward", "move_back"), door_dist=door)
+                          move_pressed=act in ("move_forward", "move_back", "use_open_door"), door_dist=door)
         self.kills = self.kills_base + int(v[7])
         enemies = snap.enemies()
 
