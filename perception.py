@@ -168,7 +168,8 @@ class DoorFinder:
     each call only re-reads sector heights.
     """
 
-    def __init__(self, sectors):
+    def __init__(self, sectors, doors):
+        self.doors = doors  # sector indices that are real doors (see navigation.door_sectors)
         segs, owner, blocking = [], [], []
         for i, sec in enumerate(sectors):
             for ln in sec.lines:
@@ -182,7 +183,8 @@ class DoorFinder:
     def distance(self, sectors, px, py, angle, reach=DOOR_SEE_UNITS):
         if not len(self.segs):
             return None
-        closed_sec = np.array([s.ceiling_height - s.floor_height < 8 for s in sectors])
+        closed_sec = np.array([i in self.doors and s.ceiling_height - s.floor_height < 8
+                               for i, s in enumerate(sectors)])
         closed = closed_sec[self.owner]
         a = math.radians(angle)
         dx, dy = math.cos(a) * reach, math.sin(a) * reach
@@ -284,5 +286,7 @@ class Describer:
         if old is None:
             return False
         window = [s for s in self.history if s.t >= old.t]
-        trying = sum(s.move_pressed for s in window) >= 0.6 * len(window)
-        return trying and math.hypot(snap.px - old.px, snap.py - old.py) < 24
+        # 30%, not most of the time: flipping between turning and walking into the same
+        # wall is stuck too.
+        trying = sum(s.move_pressed for s in window) >= 0.3 * len(window)
+        return trying and math.hypot(snap.px - old.px, snap.py - old.py) < 32

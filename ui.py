@@ -104,17 +104,17 @@ class Automap:
         h = int((self.y1 - (min(ys) - 32)) / self.SCALE) + 1
         self.lines = pg.Surface((w, h), pg.SRCALPHA)
         self.seen = pg.Surface((w, h), pg.SRCALPHA)
-        for x1, y1, x2, y2, kind in walls:
+        for x1, y1, x2, y2, kind, _ in walls:
             col = (250, 210, 60) if kind == "door" else (190, 180, 165)
             pg.draw.line(self.lines, col, self.px(x1, y1), self.px(x2, y2), 2 if kind == "door" else 1)
-        self.path = []
+        self.path, self.target = [], None
         self.box = pg.Surface((self.SIZE, self.SIZE), pg.SRCALPHA)
 
     def px(self, x, y):
         return (x - self.x0) / self.SCALE, (self.y1 - y) / self.SCALE
 
-    def update(self, path, seen):
-        self.path = path
+    def update(self, path, seen, target=None):
+        self.path, self.target = path, target
         c = max(2, int(self.N.CELL / self.SCALE) + 1)
         half = self.N.CELL / 2
         for x, y in seen:  # explored cell centers, in map units
@@ -130,6 +130,9 @@ class Automap:
         if len(self.path) > 1:
             pts = [(self.px(*p)[0] + off[0], self.px(*p)[1] + off[1]) for p in self.path]
             pg.draw.lines(box, (255, 60, 50), False, pts, 2)
+        if self.target:  # the door the current goal is to open
+            tx, ty = self.px(*self.target)
+            pg.draw.circle(box, (250, 210, 60), (tx + off[0], ty + off[1]), 6 + 2 * math.sin(time.monotonic() * 6), 2)
         a = math.radians(angle)
         tip = (half + math.cos(a) * 10, half - math.sin(a) * 10)
         l = (half + math.cos(a + 2.5) * 7, half - math.sin(a + 2.5) * 7)
@@ -215,7 +218,7 @@ class UI:
             elif msg["type"] == "geom":
                 self.automap = Automap(self.pg, msg["walls"])
             elif msg["type"] == "nav" and self.automap:
-                self.automap.update(msg["path"], msg["seen"])
+                self.automap.update(msg["path"], msg["seen"], msg.get("target"))
         while self.tape and now - self.tape[0][0] > 7:
             self.tape.popleft()
         while self.reflex_tape and now - self.reflex_tape[0][0] > 7:

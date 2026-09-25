@@ -29,14 +29,15 @@ QUESTION = {
         instructions="What should the player do next?",
         criteria={
             "turn_left": "Rotate the view left. Use when an enemy is on the left, or when no enemy is "
-                         "visible and the unexplored area is left or behind.",
+                         "visible and the goal direction is left or behind.",
             "turn_right": "Rotate the view right. Use when an enemy is on the right, or when no enemy is "
-                          "visible and the unexplored area is right.",
-            "move_forward": "Walk forward. Use when no enemy is visible and the unexplored area is ahead or "
+                          "visible and the goal direction is right.",
+            "move_forward": "Walk forward. Use when no enemy is visible and the goal direction is ahead or "
                             "slightly left or slightly right.",
             "move_back": "Step backward. Use when an enemy is very close and getting closer, or when stuck.",
             "shoot": "Fire the weapon. Use when an enemy is in the crosshair and ammo is not empty.",
-            "use_open_door": "Press the use key. Use only when a door is directly ahead.",
+            "use_open_door": "Press the use key. Use when a door is directly ahead, especially when the "
+                             "current goal is to open a door.",
         },
     )
 }
@@ -60,6 +61,7 @@ class Brain:
         self.last_unstick = 0.0
         self.door_try = None     # (door point, start time, start position) of the current attempt
         self.failed_doors = []   # (x, y, expiry): doors that did not open after a few tries
+        self.last_step = None    # (what the player just got done, time), for the state text
         self.jev_action, self.snap_q, self.event_q, self.ui_q = jev_action, snap_q, event_q, ui_q
         self.ctrl, self.metas, _ = S.views(shm.buf)
         self.describer = P.Describer()
@@ -106,9 +108,17 @@ class Brain:
                 self.map = ev["name"]
                 self.describer.reset()
                 self.grid, self.nav[1] = None, 0
+                self.last_step = None
             elif ev["type"] == "geom":
                 self.grid = N.NavGrid(ev["walls"])
                 self.new_seen = []
+            elif ev["type"] == "doors" and self.grid is not None:
+                for door in self.grid.set_open_doors(ev["open"]):
+                    cx, cy = self.grid.door_center[door]
+                    if self.latest is not None and math.hypot(cx - self.latest.px, cy - self.latest.py) < 256:
+                        self.grid.opened.add(door)  # opened by the player, not a monster
+                        self.last_step = ("opened a door", time.monotonic())
+                self.last_route = 0.0
             elif ev["type"] == "reflex":
                 self.reflex_log.append((time.strftime("%H:%M:%S"), ev["name"]))
                 self.log(t=ev["t"], kind="reflex", reflex=True, reflex_name=ev["name"], map=self.map,
@@ -137,30 +147,56 @@ class Brain:
             moved = math.hypot(snap.px - self.door_try[2][0], snap.py - self.door_try[2][1])
             if moved < 48:
                 self.failed_doors.append((dx, dy, now + 30))
+                self.last_step = ("tried a door that would not open, it may need a key or a switch", now)
                 if self.grid is not None:
+                    door = self.grid.near_door(dx, dy)
+                    if door is not None:
+                        self.grid.fail_door(door, seconds=30)
                     self.grid.block_ahead(snap.px, snap.py, snap.angle, seconds=30)
                     self.last_route = 0.0
                 snap.door_dist = None
             self.door_try = None
 
     def nav_line(self, snap, now):
-        """Route to the nearest unexplored area, in words. Also shares the heading
-        with the game so it can steer while walking."""
+        """The current goal and the route to it, in words, plus what comes next and what
+        was just done, so Jev knows where it is in the level's sequence. Also shares the
+        heading with the game so it can steer while walking."""
         if self.grid is None:
             return None
         if now - self.last_route > 0.3:
             self.last_route = now
             self.grid.route(snap.px, snap.py)
             seen = [self.grid.center(c) for c in self.new_seen]
-            self.to_ui({"type": "nav", "path": self.grid.path[::2], "seen": seen})
+            goal = self.grid.goal
+            target = self.grid.door_center[goal[1]] if goal and goal[0] == "door" else None
+            self.to_ui({"type": "nav", "path": self.grid.path[::2], "seen": seen, "target": target})
             self.new_seen = []
+        lines = []
         heading, length = self.grid.heading(snap.px, snap.py)
+        goal = self.grid.goal
         if heading is None:
             self.nav[1] = 0
-            return "Unexplored area: none found."
-        self.nav[0], self.nav[1] = heading, 1
-        dist = "close" if length < 160 else "medium" if length < 600 else "far"
-        return f"Unexplored area: {N.direction_word(N.wrap(heading - snap.angle))}, {dist}."
+            lines.append("Current goal: none, everything reachable is explored. Look around for a way on.")
+        else:
+            self.nav[0], self.nav[1] = heading, 1
+            dist = "close" if length < 160 else "medium" if length < 600 else "far"
+            where = f"{N.direction_word(N.wrap(heading - snap.angle))}, {dist}"
+            if goal[0] == "door":
+                lines.append(f"Current goal: reach the door and open it. Goal direction: {where}.")
+                lines.append("Next step: go through the door and explore.")
+            else:
+                lines.append(f"Current goal: explore. Goal direction: {where}.")
+                lines.append("Next step: when this area is explored, open a door.")
+        door, center = self.grid.nearest_door(snap.px, snap.py)
+        if door is not None:
+            d = math.hypot(center[0] - snap.px, center[1] - snap.py)
+            rel = math.degrees(math.atan2(center[1] - snap.py, center[0] - snap.px)) - snap.angle
+            lines.append(f"Nearest door on the map: {N.direction_word(N.wrap(rel))}, "
+                         f"{'close' if d < 160 else 'medium' if d < 600 else 'far'}.")
+        if self.last_step:
+            what, t = self.last_step
+            lines.append(f"Last step done: {what}, {'just now' if now - t < 5 else 'a while ago'}.")
+        return "\n".join(lines)
 
     def dps(self, window=5.0):
         now = time.monotonic()

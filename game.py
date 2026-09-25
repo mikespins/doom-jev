@@ -59,6 +59,7 @@ class Game:
         self.gaps = deque(maxlen=35 * 30)
         self.tics_done, self.play_time = 0, 0.0
         self.doors = None
+        self.door_secs, self.open_doors = [], None
         self.seq = 0
 
     def make_game(self):
@@ -93,7 +94,7 @@ class Game:
         return f"{self.map} skill {self.args.skill}" if self.campaign else self.args.scenario
 
     def announce(self):
-        self.doors = None
+        self.doors, self.open_doors = None, None
         msg = {"type": "map", "name": self.label(), "wad": self.wad.name if self.campaign else "vizdoom"}
         for q in (self.ui_q, self.event_q):
             try:
@@ -165,7 +166,8 @@ class Game:
         door = None
         if self.campaign and state.sectors:
             if self.doors is None:
-                self.doors = P.DoorFinder(state.sectors)
+                self.door_secs = sorted(N.door_sectors(state.sectors))
+                self.doors = P.DoorFinder(state.sectors, set(self.door_secs))
                 geom = {"type": "geom", "walls": N.extract_walls(state.sectors)}
                 for q in (self.event_q, self.ui_q):
                     try:
@@ -173,6 +175,14 @@ class Game:
                     except queue.Full:
                         pass
             door = self.doors.distance(state.sectors, v[3], v[4], v[5])
+            if state.tic % 5 == 0:  # tell the Jev process when doors open or close
+                now_open = [i for i in self.door_secs if N.door_open(state.sectors[i])]
+                if now_open != self.open_doors:
+                    try:
+                        self.event_q.put_nowait({"type": "doors", "open": now_open})
+                        self.open_doors = now_open
+                    except queue.Full:
+                        pass
 
         snap = P.Snapshot(tic=state.tic, t=time.monotonic(), health=v[0], armor=v[1], ammo=v[2],
                           px=v[3], py=v[4], angle=v[5], damage_taken=v[6], objs=objs, depth=depth,
@@ -193,7 +203,7 @@ class Game:
                 speed = min(S.MAX_TURN, max(0.4, 0.3 * deg))
             target = sign * speed
         elif act == "move_forward" and self.nav[1]:
-            # Walking: steer gently along the route to unexplored space.
+            # Walking: steer gently along the route to the current goal.
             rel = N.wrap(self.nav[0] - v[5])
             if abs(rel) < 70:
                 target = max(-S.MAX_TURN, min(S.MAX_TURN, -0.25 * rel))

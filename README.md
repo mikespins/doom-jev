@@ -26,9 +26,14 @@ Three processes share memory, so nothing waits on a network call:
   - recent damage and falling health
   - enemy movement trends
   - stuck
-  - `Unexplored area: slightly left, close`
+  - `Current goal: reach the door and open it. Goal direction: slightly left, medium.`
+  - `Next step: go through the door and explore.` and `Last step done: opened a door, just now.`
+  - `Nearest door on the map: right, close.`
 - **Navigation** (`navigation.py`) builds a coarse grid from the level's walls, remembers where
-  the player has been, and runs a breadth-first search to the nearest unexplored area. When Jev
+  the player has been, and picks the current goal: the nearest unexplored area, or, once there
+  is none, the nearest door not yet opened. Doors are tracked live, so an opened door stops
+  being a wall, and a door that won't open (a key or switch door) is set aside for 30 s. Code
+  only describes the goal; Jev still decides how to get there and when to press use. When Jev
   walks forward, the game steers gently along that route. When the player is stuck, the blocked
   spot is marked off-limits for 20 s so the route goes around it.
 - **Reflexes** (plain code that overrides Jev):
