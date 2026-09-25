@@ -22,20 +22,35 @@ Three processes share memory, so nothing waits on a network call:
   - position: far left … far right
   - distance: very close … far
   - health, ammo and armor levels
-  - wall ahead and door ahead
+  - wall, door and switch ahead, and the key a door needs (`Door ahead: yes, it needs the blue key`)
   - recent damage and falling health
   - enemy movement trends
   - stuck
-  - `Current goal: reach the door and open it. Goal direction: slightly left, medium.`
-  - `Next step: go through the door and explore.` and `Last step done: opened a door, just now.`
-  - `Nearest door on the map: right, close.`
-- **Navigation** (`navigation.py`) builds a coarse grid from the level's walls, remembers where
-  the player has been, and picks the current goal: the nearest unexplored area, or, once there
-  is none, the nearest door not yet opened. Doors are tracked live, so an opened door stops
-  being a wall, and a door that won't open (a key or switch door) is set aside for 30 s. Code
-  only describes the goal; Jev still decides how to get there and when to press use. When Jev
-  walks forward, the game steers gently along that route. When the player is stuck, the blocked
-  spot is marked off-limits for 20 s so the route goes around it.
+  - the plan, as checkpoints worked out from the map:
+    `Plan: get the blue key, then open the blue door, then reach the exit.`
+  - `Current goal: get the blue key. Goal direction: left, far.`
+  - `On the way: open the door, ahead, close.` and `Keys: blue.`
+  - `Nearest door on the map: right, close, needs the red key.`
+  - `Last step done: picked up the blue key, just now.`
+- **Checkpoints** (`navigation.py`, `wad.py`). The WAD's own map data says which doors open
+  with the use key and which key each needs, where the switches are, and where the exit is;
+  ViZDoom reports which keys and health are still lying around. From that, code keeps an ordered
+  plan and picks the current goal: health when low and some is known; the exit when it can be
+  reached; a key a locked door needs, once its spot has been seen; otherwise the nearest
+  unexplored area (the area here first, then through doors); then a switch not yet pressed.
+  When a step is done (a door opens, a key is picked up, a switch is pressed) the plan moves on
+  and "Last step done" says so. Nothing is scripted per level, and code only describes the goal:
+  Jev still decides every action.
+- **Navigation** keeps a 16-unit grid of the level. A cell is walkable only if Doom's 32×32
+  player fits there, clear of walls and of solid decorations like pillars and lamps. It tracks
+  doors opening and closing, and lifts and moving floors, so the route follows the level as it
+  changes. "Explored" means seen in line of sight, not just nearby. Routes are planned in a
+  background thread. When Jev walks forward, the game steers gently toward the farthest route
+  point in line of sight. A door that won't open (it needs a key, a switch, or opens only from
+  the other side) is set aside, longer each time; when the player is stuck, the blocked spot is
+  marked off-limits for 20 s so the route goes around it.
+- **Use key.** When Jev picks `use_open_door`, the game taps use once and then waits 1.5 s,
+  because pressing use on a moving door sends it back.
 - **Reflexes** (plain code that overrides Jev):
   - shoot when a live enemy is in the center 5% of the screen and closer than 400 units
   - stop walking forward when the depth buffer shows a wall within about 48 units

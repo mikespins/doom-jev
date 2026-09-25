@@ -3,6 +3,7 @@
 import math
 import os
 import queue
+import struct
 import time
 from collections import deque
 from pathlib import Path
@@ -13,6 +14,7 @@ import vizdoom as vzd
 import navigation as N
 import perception as P
 import shared as S
+import wad as WAD
 
 ARENAS = ["basic", "defend_the_center", "defend_the_line", "deadly_corridor"]
 
@@ -60,6 +62,9 @@ class Game:
         self.tics_done, self.play_time = 0, 0.0
         self.doors = None
         self.door_secs, self.open_doors = [], None
+        self.items = None
+        self.heights, self.moved_tic = None, None  # non-door sector heights, to notice lifts moving
+        self.use_tic = -999  # last tic the use key went down
         self.seq = 0
 
     def make_game(self):
@@ -70,6 +75,7 @@ class Game:
             g.set_doom_skill(self.args.skill)
             g.set_episode_timeout(0)
             g.set_sectors_info_enabled(True)  # for door detection
+            g.set_objects_info_enabled(True)  # for keys and health still on the map
         else:
             g.load_config(os.path.join(vzd.scenarios_path, f"{self.args.scenario}.cfg"))
             if self.args.scenario == "basic":
@@ -94,7 +100,8 @@ class Game:
         return f"{self.map} skill {self.args.skill}" if self.campaign else self.args.scenario
 
     def announce(self):
-        self.doors, self.open_doors = None, None
+        self.doors, self.open_doors, self.items = None, None, None
+        self.heights, self.moved_tic = None, None
         msg = {"type": "map", "name": self.label(), "wad": self.wad.name if self.campaign else "vizdoom"}
         for q in (self.ui_q, self.event_q):
             try:
@@ -155,7 +162,30 @@ class Game:
         g.new_episode()
         if not dead and self.campaign:
             self.announce()
+        elif dead:
+            self.open_doors, self.items = None, None  # the level restarts: resend both
+            try:
+                self.event_q.put_nowait({"type": "restart"})
+            except queue.Full:
+                pass
         self.turn_vel = 0.0
+
+    def watch_floors(self, state):
+        """Lifts, stairs and moving floors change where the player can walk. Once they have
+        been still for a second, send the walls again. (Doors are tracked on their own.)"""
+        doors = set(self.door_secs)
+        heights = [(s.floor_height, s.ceiling_height) for i, s in enumerate(state.sectors) if i not in doors]
+        if self.heights is not None and heights != self.heights:
+            self.moved_tic = state.tic
+        self.heights = heights
+        if self.moved_tic is not None and state.tic - self.moved_tic >= 35:
+            self.moved_tic = None
+            msg = {"type": "walls", "walls": N.extract_walls(state.sectors, doors)}
+            for q in (self.event_q, self.ui_q):
+                try:
+                    q.put_nowait(msg)
+                except queue.Full:
+                    pass
 
     def step(self, g, state):
         v = state.game_variables
@@ -168,7 +198,14 @@ class Game:
             if self.doors is None:
                 self.door_secs = sorted(N.door_sectors(state.sectors))
                 self.doors = P.DoorFinder(state.sectors, set(self.door_secs))
-                geom = {"type": "geom", "walls": N.extract_walls(state.sectors)}
+                try:
+                    info = WAD.read_map(self.wad, self.map)
+                except (OSError, KeyError, ValueError, IndexError, struct.error):
+                    info = None  # unusual WAD: plain doors, no keys or exit
+                things = [(o.position_x, o.position_y, WAD.SOLID[o.name])
+                          for o in state.objects or () if o.name in WAD.SOLID]
+                geom = {"type": "geom", "walls": N.extract_walls(state.sectors, set(self.door_secs)),
+                        "info": info, "things": things}
                 for q in (self.event_q, self.ui_q):
                     try:
                         q.put(geom, timeout=0.2)
@@ -181,6 +218,19 @@ class Game:
                     try:
                         self.event_q.put_nowait({"type": "doors", "open": now_open})
                         self.open_doors = now_open
+                    except queue.Full:
+                        pass
+            if state.tic % 10 == 0:
+                self.watch_floors(state)
+            if state.tic % 7 == 0 and state.objects is not None:  # keys and health left on the map
+                items = sorted((WAD.KEY_NAMES[o.name], round(o.position_x), round(o.position_y), "key")
+                               if o.name in WAD.KEY_NAMES else
+                               (o.name, round(o.position_x), round(o.position_y), "health")
+                               for o in state.objects if o.name in WAD.KEY_NAMES or o.name in WAD.HEALTH_NAMES)
+                if items != self.items:
+                    try:
+                        self.event_q.put_nowait({"type": "items", "items": items})
+                        self.items = items
                     except queue.Full:
                         pass
 
@@ -219,7 +269,11 @@ class Game:
             target = 0.0  # hold aim while firing
         use = False
         if act == "use_open_door":
-            use = state.tic % 2 == 0  # tap, don't hold
+            # One tap, then leave it for 1.5 s: pressing use on a moving door sends it back,
+            # so tapping every other tic kept doors jittering a few units open.
+            use = state.tic - self.use_tic >= 52
+            if use:
+                self.use_tic = state.tic
             if door is not None and door > P.USE_REACH_UNITS:
                 fwd = True  # walk up to the door while tapping use
         if fwd and wall < P.WALL_REFLEX_UNITS:

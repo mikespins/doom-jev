@@ -75,6 +75,8 @@ class Snapshot:
     depth: np.ndarray
     move_pressed: bool
     door_dist: float | None = None  # map units to a closed door straight ahead
+    door_key: str | None = None     # the key color that door needs, set by the Jev process
+    switch_ahead: bool = False      # a switch within reach straight ahead, set by the Jev process
 
     def enemies(self):
         return [o for o in self.objs if is_enemy(o.name) and o.alive_shape]
@@ -211,9 +213,11 @@ class Describer:
     def __init__(self):
         self.history = deque()  # snapshots from the last few seconds
         self.stuck = False
+        self.stuck_until = 0.0
 
     def reset(self):
         self.history.clear()
+        self.stuck_until = 0.0
 
     def _past(self, age):
         """Most recent snapshot at least `age` seconds old."""
@@ -270,13 +274,16 @@ class Describer:
                 f"{o.name} {position_word(o.cx)} {distance_word(snap.dist(o))}" for o in items) + ".")
 
         wall = ahead_distance(snap.depth) < WALL_AHEAD_UNITS
-        lines.append(f"Wall directly ahead: {'yes' if wall else 'no'}. "
-                     f"Door ahead: {'no' if snap.door_dist is None else 'yes'}. "
+        door = "no" if snap.door_dist is None else f"yes, it needs the {snap.door_key} key" if snap.door_key else "yes"
+        lines.append(f"Wall directly ahead: {'yes' if wall else 'no'}. Door ahead: {door}. "
+                     f"Switch ahead: {'yes' if snap.switch_ahead else 'no'}. "
                      f"Most open space: {open_side(snap.depth)}.")
 
         if nav_line:
             lines.append(nav_line)
-        self.stuck = self._stuck(snap)
+        if self._stuck(snap):
+            self.stuck_until = snap.t + 1.5  # hold it, so it doesn't flicker as the player backs off
+        self.stuck = snap.t < self.stuck_until
         lines.append(f"Stuck: {'yes' if self.stuck else 'no'}.")
         return "\n".join(lines)
 

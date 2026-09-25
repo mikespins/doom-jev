@@ -36,8 +36,9 @@ QUESTION = {
                             "slightly left or slightly right.",
             "move_back": "Step backward. Use when an enemy is very close and getting closer, or when stuck.",
             "shoot": "Fire the weapon. Use when an enemy is in the crosshair and ammo is not empty.",
-            "use_open_door": "Press the use key. Use when a door is directly ahead, especially when the "
-                             "current goal is to open a door.",
+            "use_open_door": "Press the use key, which opens doors and presses switches. Use when a door or "
+                             "a switch is directly ahead, especially when the goal is to open it. Not for a "
+                             "door that needs a key the player does not have.",
         },
     )
 }
@@ -59,9 +60,11 @@ class Brain:
         self.new_seen = []
         self.last_route = 0.0
         self.last_unstick = 0.0
-        self.door_try = None     # (door point, start time, start position) of the current attempt
-        self.failed_doors = []   # (x, y, expiry): doors that did not open after a few tries
+        self.door_try = None     # the door ahead that the player is trying to open, see check_door
         self.last_step = None    # (what the player just got done, time), for the state text
+        self.items = []          # (name, x, y, kind) keys and health still on the map
+        self.all_keys = set()    # key colors this map has had
+        self.planning = False
         self.jev_action, self.snap_q, self.event_q, self.ui_q = jev_action, snap_q, event_q, ui_q
         self.ctrl, self.metas, _ = S.views(shm.buf)
         self.describer = P.Describer()
@@ -104,20 +107,41 @@ class Brain:
                 ev = self.event_q.get_nowait()
             except queue.Empty:
                 break
+            now = time.monotonic()
             if ev["type"] == "map":
                 self.map = ev["name"]
                 self.describer.reset()
                 self.grid, self.nav[1] = None, 0
-                self.last_step = None
+                self.last_step, self.items, self.all_keys = None, [], set()
             elif ev["type"] == "geom":
-                self.grid = N.NavGrid(ev["walls"])
+                self.grid = N.NavGrid(ev["walls"], ev.get("info"), ev.get("things"))
                 self.new_seen = []
+                self.last_route = 0.0
+            elif ev["type"] == "walls" and self.grid is not None:
+                asyncio.get_running_loop().run_in_executor(None, self.grid.set_walls, ev["walls"])
+                self.last_route = 0.0
+            elif ev["type"] == "restart":
+                self.describer.reset()
+                self.last_step = ("died, the level restarted", now)
+                if self.grid is not None:
+                    self.grid.pressed.clear()
             elif ev["type"] == "doors" and self.grid is not None:
                 for door in self.grid.set_open_doors(ev["open"]):
                     cx, cy = self.grid.door_center[door]
                     if self.latest is not None and math.hypot(cx - self.latest.px, cy - self.latest.py) < 256:
                         self.grid.opened.add(door)  # opened by the player, not a monster
-                        self.last_step = ("opened a door", time.monotonic())
+                        key = self.grid.door_key.get(door)
+                        self.last_step = (f"opened the {key} door" if key else "opened a door", now)
+                self.last_route = 0.0
+            elif ev["type"] == "items":
+                old = self.items
+                self.items = [tuple(i) for i in ev["items"]]
+                self.all_keys |= {n for n, _, _, k in self.items if k == "key"}
+                gone = set(old) - set(self.items)
+                snap = self.latest
+                for n, x, y, k in gone:  # picked up (by the player, since monsters don't pick up)
+                    if snap is not None and math.hypot(x - snap.px, y - snap.py) < 128:
+                        self.last_step = (f"picked up the {n} key" if k == "key" else "picked up health", now)
                 self.last_route = 0.0
             elif ev["type"] == "reflex":
                 self.reflex_log.append((time.strftime("%H:%M:%S"), ev["name"]))
@@ -126,77 +150,133 @@ class Brain:
                          chosen="shoot" if ev["name"] == "shoot" else "stop_forward",
                          jev_action_overridden=ev["overrode"], latency_ms=0.0)
 
+    def keys(self):
+        """Key colors the player holds: ones this map had that are no longer lying around."""
+        return self.all_keys - {n for n, _, _, k in self.items if k == "key"}
+
     def check_door(self, snap, now):
-        """Give up on a "door" that hasn't opened after ~2.5 s of trying: hide it from
-        Jev for 30 s and route around it."""
-        self.failed_doors = [d for d in self.failed_doors if d[2] > now]
-        if snap.door_dist is None:
-            self.door_try = None
+        """Name the door ahead's key, and give up on a door still shut after ~3 s and 10
+        presses of use. The attempt survives Jev mixing in other actions (backing off,
+        turning); it ends only when the door has been out of view for 2 s. A given-up door
+        (it needs a key, a switch, or opens only from the other side) is hidden from Jev and
+        left out of the plan for a while, longer each time."""
+        grid = self.grid
+        door = None
+        if snap.door_dist is not None and grid is not None:
+            a = math.radians(snap.angle)
+            door = grid.near_door(snap.px + math.cos(a) * snap.door_dist, snap.py + math.sin(a) * snap.door_dist)
+        if door is None:
+            if self.door_try and now - self.door_try["seen"] > 2:
+                self.door_try = None
             return
-        a = math.radians(snap.angle)
-        dx, dy = snap.px + math.cos(a) * snap.door_dist, snap.py + math.sin(a) * snap.door_dist
-        if any(math.hypot(dx - x, dy - y) < 64 for x, y, _ in self.failed_doors):
+        key = grid.door_key.get(door)
+        snap.door_key = key
+        if door in grid.failed:
             snap.door_dist = None
             return
-        trying = S.ACTIONS[self.jev_action.value] == "use_open_door"
-        if not trying:
-            self.door_try = None
-        elif self.door_try is None or math.hypot(dx - self.door_try[0][0], dy - self.door_try[0][1]) > 64:
-            self.door_try = ((dx, dy), now, (snap.px, snap.py))
-        elif now - self.door_try[1] > 2.5:
-            moved = math.hypot(snap.px - self.door_try[2][0], snap.py - self.door_try[2][1])
-            if moved < 48:
-                self.failed_doors.append((dx, dy, now + 30))
-                self.last_step = ("tried a door that would not open, it may need a key or a switch", now)
-                if self.grid is not None:
-                    door = self.grid.near_door(dx, dy)
-                    if door is not None:
-                        self.grid.fail_door(door, seconds=30)
-                    self.grid.block_ahead(snap.px, snap.py, snap.angle, seconds=30)
-                    self.last_route = 0.0
-                snap.door_dist = None
+        t = self.door_try
+        if t is None or t["door"] != door:
+            t = self.door_try = {"door": door, "start": now, "uses": 0, "seen": now}
+        t["seen"] = now
+        if S.ACTIONS[self.jev_action.value] == "use_open_door":
+            t["uses"] += 1
+        if t["uses"] >= 10 and now - t["start"] > 3:
+            if key and key not in self.keys():
+                what = f"tried the {key} door, it needs the {key} key"
+            else:
+                what = "tried a door that would not open, it may need a switch or open from the other side"
+            self.last_step = (what, now)
+            grid.fail_door(door)
+            grid.block_ahead(snap.px, snap.py, snap.angle, seconds=10)
+            self.last_route = 0.0
+            snap.door_dist = None
             self.door_try = None
 
-    def nav_line(self, snap, now):
-        """The current goal and the route to it, in words, plus what comes next and what
-        was just done, so Jev knows where it is in the level's sequence. Also shares the
-        heading with the game so it can steer while walking."""
-        if self.grid is None:
+    def check_switch(self, snap):
+        """A switch line within reach straight ahead, with nothing in front of it. When Jev
+        presses use on it, count it as pressed."""
+        grid = self.grid
+        if grid is None or not grid.switches:
+            return
+        a = math.radians(snap.angle)
+        dx, dy = math.cos(a) * P.USE_REACH_UNITS, math.sin(a) * P.USE_REACH_UNITS
+        best = None
+        for i, (x3, y3, x4, y4, _key) in enumerate(grid.switches):
+            ex, ey = x4 - x3, y4 - y3
+            den = dx * ey - dy * ex
+            if abs(den) < 1e-9:
+                continue
+            t = ((x3 - snap.px) * ey - (y3 - snap.py) * ex) / den
+            u = ((x3 - snap.px) * dy - (y3 - snap.py) * dx) / den
+            if 0 <= t <= 1 and 0 <= u <= 1 and (best is None or t < best[0]):
+                best = (t, i)
+        if best is None or P.ahead_distance(snap.depth) < best[0] * P.USE_REACH_UNITS - 24:
+            return
+        snap.switch_ahead = True
+        if S.ACTIONS[self.jev_action.value] == "use_open_door" and best[1] not in grid.pressed:
+            grid.pressed.add(best[1])
+            self.last_step = ("pressed a switch", time.monotonic())
+            self.last_route = 0.0
+
+    async def replan(self, grid, snap):
+        """Work out the checkpoints in a thread, so the route search never holds up Jev requests."""
+        try:
+            plan = await asyncio.to_thread(grid.plan_route, snap.px, snap.py, snap.health, self.keys(), self.items)
+        finally:
+            self.planning = False
+        if grid is not self.grid:
+            return  # the map changed meanwhile
+        seen = [grid.center(c) for c in self.new_seen]
+        self.new_seen = []
+        self.to_ui({"type": "nav", "path": plan.path[::2], "seen": seen,
+                    "target": plan.target or (grid.door_center[plan.door] if plan.door is not None else None),
+                    "kind": plan.kind})
+
+    def goal_lines(self, snap, now):
+        """The current checkpoint, the ones after it and what was just done, in words, so Jev
+        knows where it is in the level. Also shares the route heading with the game so it
+        can steer while Jev walks."""
+        grid = self.grid
+        if grid is None:
             return None
-        if now - self.last_route > 0.3:
-            self.last_route = now
-            self.grid.route(snap.px, snap.py)
-            seen = [self.grid.center(c) for c in self.new_seen]
-            goal = self.grid.goal
-            target = self.grid.door_center[goal[1]] if goal and goal[0] == "door" else None
-            self.to_ui({"type": "nav", "path": self.grid.path[::2], "seen": seen, "target": target})
-            self.new_seen = []
+        if not self.planning and now - self.last_route > 0.4:
+            self.last_route, self.planning = now, True
+            asyncio.create_task(self.replan(grid, snap))
+        plan = grid.plan
+        keys = sorted(self.keys())
         lines = []
-        heading, length = self.grid.heading(snap.px, snap.py)
-        goal = self.grid.goal
+        if plan.steps:
+            lines.append("Plan: " + ", then ".join([plan.goal] + plan.steps) + ".")
+        heading, length = grid.heading(snap.px, snap.py)
         if heading is None:
             self.nav[1] = 0
-            lines.append("Current goal: none, everything reachable is explored. Look around for a way on.")
+            lines.append(f"Current goal: {plan.goal}.")
         else:
             self.nav[0], self.nav[1] = heading, 1
-            dist = "close" if length < 160 else "medium" if length < 600 else "far"
-            where = f"{N.direction_word(N.wrap(heading - snap.angle))}, {dist}"
-            if goal[0] == "door":
-                lines.append(f"Current goal: reach the door and open it. Goal direction: {where}.")
-                lines.append("Next step: go through the door and explore.")
-            else:
-                lines.append(f"Current goal: explore. Goal direction: {where}.")
-                lines.append("Next step: when this area is explored, open a door.")
-        door, center = self.grid.nearest_door(snap.px, snap.py)
+            lines.append(f"Current goal: {plan.goal}. Goal direction: {self.where(snap, heading, length)}.")
+        if plan.door is not None and plan.door_at < 200:
+            c = grid.door_center[plan.door]
+            key = grid.door_key.get(plan.door)
+            ang = math.degrees(math.atan2(c[1] - snap.py, c[0] - snap.px))
+            lines.append(f"On the way: open the {key + ' ' if key else ''}door, "
+                         f"{self.where(snap, ang, math.hypot(c[0] - snap.px, c[1] - snap.py))}.")
+        lines.append(f"Keys: {', '.join(keys) if keys else 'none'}.")
+        door, center = grid.nearest_door(snap.px, snap.py)
         if door is not None:
             d = math.hypot(center[0] - snap.px, center[1] - snap.py)
-            rel = math.degrees(math.atan2(center[1] - snap.py, center[0] - snap.px)) - snap.angle
-            lines.append(f"Nearest door on the map: {N.direction_word(N.wrap(rel))}, "
-                         f"{'close' if d < 160 else 'medium' if d < 600 else 'far'}.")
+            ang = math.degrees(math.atan2(center[1] - snap.py, center[0] - snap.px))
+            key = grid.door_key.get(door)
+            lines.append(f"Nearest door on the map: {self.where(snap, ang, d)}"
+                         + (f", needs the {key} key" if key and key not in keys else "") + ".")
         if self.last_step:
             what, t = self.last_step
             lines.append(f"Last step done: {what}, {'just now' if now - t < 5 else 'a while ago'}.")
         return "\n".join(lines)
+
+    @staticmethod
+    def where(snap, heading, dist):
+        return (f"{N.direction_word(N.wrap(heading - snap.angle))}, "
+                f"{'close' if dist < 160 else 'medium' if dist < 600 else 'far'}")
 
     def dps(self, window=5.0):
         now = time.monotonic()
@@ -222,7 +302,8 @@ class Brain:
                         and len(self.sent_times) < self.args.max_per_minute):
                     last_tic = snap.tic
                     self.check_door(snap, now)
-                    self.text = self.describer.describe(snap, self.nav_line(snap, now))
+                    self.check_switch(snap)
+                    self.text = self.describer.describe(snap, self.goal_lines(snap, now))
                     if self.describer.stuck and self.grid is not None and now - self.last_unstick > 2:
                         self.last_unstick = now  # route around whatever we are pushing against
                         self.grid.block_ahead(snap.px, snap.py, snap.angle)

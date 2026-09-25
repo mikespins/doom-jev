@@ -92,9 +92,12 @@ class Automap:
     """Low-poly overhead map drawn over the game view: walls, doors, explored
     area, the route code is steering along, and the player arrow."""
     SCALE = 5.0  # map units per pixel
+    KEY_COLORS = {"blue": (70, 120, 255), "red": (240, 60, 60), "yellow": (250, 230, 40)}
+    GOAL_COLORS = {"exit": (80, 230, 110), "key": (90, 160, 255), "health": (255, 255, 255),
+                   "switch": (80, 220, 230)}
     SIZE = 300
 
-    def __init__(self, pg, walls):
+    def __init__(self, pg, walls, info=None, things=()):
         import navigation as N
         self.pg, self.N = pg, N
         xs = [w[0] for w in walls] + [w[2] for w in walls]
@@ -104,17 +107,29 @@ class Automap:
         h = int((self.y1 - (min(ys) - 32)) / self.SCALE) + 1
         self.lines = pg.Surface((w, h), pg.SRCALPHA)
         self.seen = pg.Surface((w, h), pg.SRCALPHA)
-        for x1, y1, x2, y2, kind, _ in walls:
-            col = (250, 210, 60) if kind == "door" else (190, 180, 165)
-            pg.draw.line(self.lines, col, self.px(x1, y1), self.px(x2, y2), 2 if kind == "door" else 1)
-        self.path, self.target = [], None
+        self.info, self.things = info or {}, things or ()
+        self.draw_lines(walls)
+        self.path, self.target, self.kind = [], None, None
         self.box = pg.Surface((self.SIZE, self.SIZE), pg.SRCALPHA)
+
+    def draw_lines(self, walls):
+        """Walls, doors (colored by the key they need), solid decorations and the exit."""
+        pg = self.pg
+        self.lines.fill((0, 0, 0, 0))
+        keys = self.info.get("doors") or {}
+        for x1, y1, x2, y2, kind, door in walls:
+            col = (190, 180, 165) if kind != "door" else self.KEY_COLORS.get(keys.get(door), (250, 210, 60))
+            pg.draw.line(self.lines, col, self.px(x1, y1), self.px(x2, y2), 2 if kind == "door" else 1)
+        for x, y, r in self.things:  # pillars, lamps, barrels
+            pg.draw.rect(self.lines, (190, 180, 165), (*self.px(x - r, y + r), 2 * r / self.SCALE, 2 * r / self.SCALE), 1)
+        for x1, y1, x2, y2, *_ in self.info.get("exits", []):
+            pg.draw.line(self.lines, (80, 230, 110), self.px(x1, y1), self.px(x2, y2), 3)
 
     def px(self, x, y):
         return (x - self.x0) / self.SCALE, (self.y1 - y) / self.SCALE
 
-    def update(self, path, seen, target=None):
-        self.path, self.target = path, target
+    def update(self, path, seen, target=None, kind=None):
+        self.path, self.target, self.kind = path, target, kind
         c = max(2, int(self.N.CELL / self.SCALE) + 1)
         half = self.N.CELL / 2
         for x, y in seen:  # explored cell centers, in map units
@@ -130,9 +145,9 @@ class Automap:
         if len(self.path) > 1:
             pts = [(self.px(*p)[0] + off[0], self.px(*p)[1] + off[1]) for p in self.path]
             pg.draw.lines(box, (255, 60, 50), False, pts, 2)
-        if self.target:  # the door the current goal is to open
+        if self.target:  # the current checkpoint: a key, the exit, health, a switch, or a door on the way
             tx, ty = self.px(*self.target)
-            pg.draw.circle(box, (250, 210, 60), (tx + off[0], ty + off[1]), 6 + 2 * math.sin(time.monotonic() * 6), 2)
+            pg.draw.circle(box, self.GOAL_COLORS.get(self.kind, (250, 210, 60)), (tx + off[0], ty + off[1]), 6 + 2 * math.sin(time.monotonic() * 6), 2)
         a = math.radians(angle)
         tip = (half + math.cos(a) * 10, half - math.sin(a) * 10)
         l = (half + math.cos(a + 2.5) * 7, half - math.sin(a + 2.5) * 7)
@@ -216,9 +231,11 @@ class UI:
                 self.map_name = msg["name"]
                 self.automap = None
             elif msg["type"] == "geom":
-                self.automap = Automap(self.pg, msg["walls"])
+                self.automap = Automap(self.pg, msg["walls"], msg.get("info"), msg.get("things"))
+            elif msg["type"] == "walls" and self.automap:
+                self.automap.draw_lines(msg["walls"])
             elif msg["type"] == "nav" and self.automap:
-                self.automap.update(msg["path"], msg["seen"], msg.get("target"))
+                self.automap.update(msg["path"], msg["seen"], msg.get("target"), msg.get("kind"))
         while self.tape and now - self.tape[0][0] > 7:
             self.tape.popleft()
         while self.reflex_tape and now - self.reflex_tape[0][0] > 7:
