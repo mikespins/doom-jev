@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+logs/
+*.pyc
+_vizdoom/
+_vizdoom.ini
